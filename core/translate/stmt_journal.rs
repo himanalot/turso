@@ -149,10 +149,13 @@ pub(crate) fn set_insert_stmt_journal_flags(
     );
     let has_check = !table.check_constraints.is_empty();
     // Multi-row INSERT can evaluate row-dependent SELECT/VALUES expressions
-    // while writes are already in progress. Those expressions are not captured
-    // by constraint analysis, so keep the statement savepoint unless the insert
-    // is proven single-row.
+    // while writes are already in progress. REPLACE can also delete a
+    // conflicting row before later replacement-row/index expression work fails.
+    // These abort paths are not captured by constraint analysis, so keep the
+    // statement savepoint unless the insert is proven single-row without any
+    // effective REPLACE path.
     let may_abort = inserting_multiple_rows
+        || any_replace
         || has_triggers
         || has_fks
         || constraint_may_abort(

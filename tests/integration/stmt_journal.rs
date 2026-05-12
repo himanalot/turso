@@ -46,8 +46,9 @@ fn insert_single_row_no_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> 
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b, c);")]
 fn insert_multi_row_no_constraints(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    // Multi-row but no may_abort → still no stmt journal.
-    assert!(!needs_stmt_journal(
+    // Multi-row inserts keep a statement journal because row-dependent
+    // VALUES/SELECT expressions can abort after earlier rows were written.
+    assert!(needs_stmt_journal(
         &conn,
         "INSERT INTO t VALUES (1,2,3),(4,5,6)"
     ));
@@ -86,11 +87,12 @@ fn insert_multi_row_unique(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// INSERT OR IGNORE with UNIQUE → may_abort is false (not OE_Abort).
+/// INSERT OR IGNORE with UNIQUE still keeps the multi-row expression-abort
+/// savepoint.
 #[turso_macros::test(init_sql = "CREATE TABLE t (a UNIQUE, b);")]
 fn insert_or_ignore_multi_row_unique(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(
+    assert!(needs_stmt_journal(
         &conn,
         "INSERT OR IGNORE INTO t VALUES (1, 2), (3, 4)"
     ));
@@ -98,12 +100,12 @@ fn insert_or_ignore_multi_row_unique(tmp_db: TempDatabase) -> anyhow::Result<()>
 }
 
 /// INSERT OR REPLACE is multi-write (REPLACE may delete conflicting rows).
-/// But may_abort=false (conflict resolution is not OE_Abort).
-/// needs_stmt = true && false = false.
+/// The statement journal is required because later replacement-row/index work
+/// can abort after the conflicting row has already been deleted.
 #[turso_macros::test(init_sql = "CREATE TABLE t (a UNIQUE, b);")]
 fn insert_or_replace_single_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(
+    assert!(needs_stmt_journal(
         &conn,
         "INSERT OR REPLACE INTO t VALUES (1, 2)"
     ));
@@ -193,8 +195,9 @@ fn insert_fk_violation_in_tx_rolls_back_row(tmp_db: TempDatabase) -> anyhow::Res
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn update_no_where(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    // Multi-write (table scan), but no constraints → may_abort=false.
-    assert!(!needs_stmt_journal(&conn, "UPDATE t SET a = 1"));
+    // Multi-row UPDATE keeps a statement journal because SET/WHERE/index
+    // expressions can abort after earlier rows were written.
+    assert!(needs_stmt_journal(&conn, "UPDATE t SET a = 1"));
     Ok(())
 }
 
@@ -293,11 +296,12 @@ fn update_composite_unique_partial_cols(tmp_db: TempDatabase) -> anyhow::Result<
 // DELETE
 // ──────────────────────────────────────────────────────────
 
-/// DELETE with no WHERE (table scan) + no constraints → multi-write, no may-abort.
+/// DELETE with no WHERE is multi-write and conservatively keeps the statement
+/// journal for row-dependent abort paths in DELETE planning.
 #[turso_macros::test(init_sql = "CREATE TABLE t (a, b);")]
 fn delete_no_where(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    assert!(!needs_stmt_journal(&conn, "DELETE FROM t"));
+    assert!(needs_stmt_journal(&conn, "DELETE FROM t"));
     Ok(())
 }
 
@@ -561,5 +565,51 @@ fn insert_replace_notnull_no_default_preserves_row(tmp_db: TempDatabase) -> anyh
         "integrity_check failed after INSERT OR REPLACE abort"
     );
     conn.execute("ROLLBACK")?;
+    Ok(())
+}
+
+/// INSERT OR REPLACE where the REPLACE preflight deletes a conflicting row,
+/// but later replacement-row expression-index evaluation fails. The deleted
+/// row must be restored before the surrounding transaction can commit.
+#[turso_macros::test]
+fn insert_replace_expression_index_abort_preserves_row(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = WAL")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INT)")?;
+    conn.execute(
+        "CREATE INDEX idx ON t(
+            CASE
+                WHEN b = 2 THEN 'x' LIKE 'x' ESCAPE 'yy'
+                ELSE b
+            END
+        )",
+    )?;
+    conn.execute("INSERT INTO t VALUES(1, 1)")?;
+
+    assert!(
+        needs_stmt_journal(&conn, "INSERT OR REPLACE INTO t VALUES(1, 2)"),
+        "single-row REPLACE must retain a statement journal because later index expression work can abort"
+    );
+
+    conn.execute("BEGIN")?;
+    let result = conn.execute("INSERT OR REPLACE INTO t VALUES(1, 2)");
+    assert!(
+        result.is_err(),
+        "INSERT should fail during index expression evaluation"
+    );
+
+    let rows = query_rows(&conn, "SELECT id, b FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|1"], "original row should be preserved");
+
+    let ic = query_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(
+        ic,
+        vec!["ok"],
+        "integrity_check failed after INSERT OR REPLACE expression-index abort"
+    );
+
+    conn.execute("COMMIT")?;
+    let rows = query_rows(&conn, "SELECT id, b FROM t ORDER BY id");
+    assert_eq!(rows, vec!["1|1"], "commit should keep the original row");
     Ok(())
 }
